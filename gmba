@@ -28,7 +28,8 @@ except:
 
 '''
 Example Usage:
-gmba 
+gmba /ix1/tibrahim/jil202/gmba/img/mni_806406_20220622145253_thickmap.nii.gz /ix1/tibrahim/jil202/gmba/img/mni_806406_20220622145253_gmba.csv MNI
+gmba /ix1/tibrahim/jil202/gmba/img/806406_20220622145253_thickmap.nii.gz /ix1/tibrahim/jil202/gmba/img/806406_20220622145253_gmba.csv
 '''
 gm_path = natsorted(glob.glob(f'{img}'))
 
