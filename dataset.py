@@ -14,18 +14,23 @@ template = '/ix1/tibrahim/jil202/07-Myelin_mapping/mni_icbm152_nlin_asym_09a/mni
 template = ants.image_read(template)
 
 class ratio_dataset(Dataset):
-    def __init__(self, nii_dir, transform=None):
+    def __init__(self, nii_dir, MNI=False, transform=None):
         self.nii_dir = nii_dir
         self.transform = transform
+        self.MNI = MNI
         
     def __len__(self):
         return len(self.nii_dir)
     
     def __getitem__(self, idx):
         
-        mi = ants.image_read(self.nii_dir[idx])
-        mytx = ants.registration(fixed=template, moving=mi, type_of_transform = 'Rigid' )
-        nii_img = mytx['warpedmovout'].numpy()
+        if self.MNI:
+            nii_img = nib.load(self.nii_dir[idx]).get_fdata()
+            
+        else:
+            mi = ants.image_read(self.nii_dir[idx])
+            mytx = ants.registration(fixed=template, moving=mi, type_of_transform = 'Rigid' )
+            nii_img = mytx['warpedmovout'].numpy()
         
         nii_img[nii_img<0] = 0
         nii_img[nii_img>10] = 0

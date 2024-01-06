@@ -16,13 +16,27 @@ import sys
 
 img = sys.argv[1]
 output = sys.argv[2]
-print(f'Reading image(s): {img}')
-print(f'Output will be saved to: {output}')
+try:
+    mni = sys.argv[3]
+    print(f'Reading MNI spaced image(s): {img}')
+    print(f'Output will be saved to: {output}')
+except:
+    mni = 'native'
+    print(f'Reading Native spaced image(s): {img}')
+    print(f'Output will be saved to: {output}')
+    print('Warning!! Brain age might not be accurate if the image is not MNI Spaced. The code will help you convert the inference image to the MNI space if it is not.')
 
 '''
-
+Example Usage:
+gmba 
 '''
 gm_path = natsorted(glob.glob(f'{img}'))
+
+if mni == 'MNI':
+    gm_dataset = ratio_dataset(gm_path, MNI=True)
+else:
+    gm_dataset = ratio_dataset(gm_path, MNI=False)
+    
 gm_dataset = ratio_dataset(gm_path)
 gm_loader = DataLoader(gm_dataset, batch_size=1, shuffle=False)
 
@@ -49,10 +63,10 @@ class agePrediction(torch.nn.Module):
 gm_model = torch.load('/ix1/haizenstein/jil202/paper/gm_brainAge/model/camcan_ctx_96x96x96.pth', map_location=device)    
 gm_model = gm_model.to(device)
 gm_model.eval()
+gm_model = agePrediction(gm_model)
 
 age_prediction = []
 IDs = []
-gm_model = agePrediction(gm_model)
 for idx, [img, ID] in enumerate(tqdm(gm_loader)):
     IDs.append(list(ID))
     img = torch.unsqueeze(img, 1).float().to(device)
