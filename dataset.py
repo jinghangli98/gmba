@@ -2,40 +2,73 @@ import torch
 import numpy as np
 import glob
 import nibabel as nib
-from torch.utils.data import Dataset, DataLoader, random_split
-import pdb
-import random
+from torch.utils.data import Dataset, DataLoader
 import torchio as tio
 from natsort import natsorted
 import pandas as pd
-import ants
+import random
+from pathlib import Path
+import pdb
 
-template = '/ix1/tibrahim/jil202/07-Myelin_mapping/mni_icbm152_nlin_asym_09a/mni_icbm152_t1_tal_nlin_asym_09a.nii'
-template = ants.image_read(template)
-
-class ratio_dataset(Dataset):
-    def __init__(self, nii_dir, MNI=False, transform=None):
-        self.nii_dir = nii_dir
+class BrainDataset(Dataset):
+    def __init__(self, report_paths, nii_paths, type, transform=None, image_size=[96,96,96]):
+        """
+        Args:
+            report_paths (list): List of paths to report CSV files
+            nii_paths (list): List of paths to NIfTI files
+            transform (callable, optional): Optional transform to be applied
+        """
         self.transform = transform
-        self.MNI = MNI
-        
+        self.report_paths = report_paths 
+        self.type = type
+        try:
+            self.df = pd.concat([pd.read_csv(file) for file in report_paths])
+        except:
+            self.df = pd.read_csv(report_paths)
+        self.df.reset_index(drop=True, inplace=True)
+        self.nii_paths = nii_paths
+
+        input_x, input_y, input_z = image_size
+        self.preprocessing = tio.Compose([tio.transforms.CropOrPad((input_x, input_y, input_z)),])
+
     def __len__(self):
-        return len(self.nii_dir)
-    
+        return len(self.nii_paths)
+
     def __getitem__(self, idx):
+        nii_path = self.nii_paths[idx]
+        nii_img = nib.load(nii_path)
+        image = nii_img.get_fdata()
         
-        if self.MNI:
-            nii_img = nib.load(self.nii_dir[idx]).get_fdata()
+        subject_id = Path(nii_path).parent.name
+        subject_data = self.df[self.df['SubjectID'] == subject_id].iloc[0]
+        
+        age = subject_data['age']
+        sex = self._convert_sex(subject_data['sex'])
+        
+        image = self._preprocess_image(image)
+        
+        image = torch.FloatTensor(image)
+        image = image.unsqueeze(0)  
+        
+        if self.transform:
+            image = self.transform(image)
             
-        else:
-            mi = ants.image_read(self.nii_dir[idx])
-            mytx = ants.registration(fixed=template, moving=mi, type_of_transform = 'Rigid' )
-            nii_img = mytx['warpedmovout'].numpy()
+        return {'image': image, 'age': torch.FloatTensor([age]), 'sex': torch.FloatTensor([sex]), 'ID': subject_id} 
+    
+    def _convert_sex(self, sex):
+        """Convert sex to numerical value"""
+        if sex in ['F', 'Female', 'FEMALE']:
+            return 0
+        elif sex in ['M', 'Male', 'MALE']:
+            return 1
+        return -1
+    
+    def _preprocess_image(self, image):
+        """Preprocess the image data"""
+        processed = self.preprocessing(np.expand_dims(image, 0))
+        if self.type == 'r_T1w_norm_noskull':
         
-        nii_img[nii_img<0] = 0
-        nii_img[nii_img>10] = 0
-        nii_img = np.float32(nii_img)
-   
-        transform = tio.Resize((96,96,96))        
-        image = transform(np.expand_dims(nii_img, axis=0))
-        return np.squeeze(image), self.nii_dir[idx].split('/')[-1]
+            return np.squeeze(processed)/processed.max()
+        elif self.type == 'r_thickmap':
+        
+            return np.squeeze(processed)
