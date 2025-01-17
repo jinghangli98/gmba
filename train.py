@@ -66,11 +66,11 @@ config = {
         'input_size': [144,176,128], #9,11,8
         'num_workers': 0,
         'train_ratio': 0.8,
-        'batch_size': 32,
+        'batch_size': 16,
         'num_young': 4,
         'num_elderly': 4, 
         'dataset': ['camcan', 'HCP_aging', 'NIMH-IRP'],
-        'type': 'r_T1w_norm_noskull' #r_thickmap, r_T1w_norm_noskull
+        'type': 'r_thickmap' #r_thickmap, r_T1w_norm_noskull
     }
 
 ## Setting up dataloader ########################################################
@@ -108,7 +108,7 @@ test_loader = DataLoader(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = Conditional3DVAE(config).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10, verbose=True)
 best_val_loss = float('inf') 
 
 train_losses = []
@@ -136,7 +136,7 @@ for epoch in range(config["num_epochs"]):
         age_loss = torch.nn.L1Loss()(age, predicted_age)
 
         predicted_ages.extend(predicted_age.detach().cpu().numpy())
-        loss = (recon_loss + kl_loss + age_loss).mean()
+        loss = (recon_loss + 0.1 * kl_loss + age_loss).mean()
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -195,14 +195,11 @@ for epoch in range(config["num_epochs"]):
     slope, intercept, r_value, p_value, std_err = stats.linregress(np.array(true_age).flatten(), np.array(predicted_ages).flatten())
     r_squared = r_value ** 2
 
-    plt.scatter(true_age, predicted_ages)
-    plt.savefig('test_regression_brain.png')
-    plt.close()
-    # plotlatent(latents, true_ages, save_path='latent.png')
+    plotlatent(latents, true_ages, save_path='latent.png')
     
-    # recon = model.genBrain(torch.tensor([25, 60]))
-    # nib.save(nib.Nifti1Image(recon[0], np.eye(4)), '25.nii.gz')
-    # nib.save(nib.Nifti1Image(recon[1], np.eye(4)), '60.nii.gz')
+    recon = model.genBrain(torch.tensor([25, 60]))
+    nib.save(nib.Nifti1Image(recon[0], np.eye(4)), f'25_{data_type}.nii.gz')
+    nib.save(nib.Nifti1Image(recon[1], np.eye(4)), f'60_{data_type}.nii.gz')
     
     avg_val_loss = val_epoch_loss / len(test_loader)
     val_losses.append(avg_val_loss)
@@ -213,10 +210,10 @@ for epoch in range(config["num_epochs"]):
     print(f'Train Loss: {avg_train_loss:.4f}')
     print(f'Val Loss: {avg_val_loss:.4f}')
 
-    # if r_squared > r_squared_best:
-    #     torch.save(model.state_dict(), 'weights_brain_best.pt')
-    #     r_squared_best = r_squared
+    if r_squared > r_squared_best:
+        torch.save(model.state_dict(), f'{data_type}_best.pt')
+        r_squared_best = r_squared
 
-    #     plt.scatter(true_age, predicted_ages)
-    #     plt.savefig('test_regression_brain_best.png')
-    #     plt.close()
+        plt.scatter(true_age, predicted_ages)
+        plt.savefig(f'test_regression_{data_type}_best.png')
+        plt.close()
