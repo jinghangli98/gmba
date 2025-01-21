@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from model import Conditional3DVAE
 from dataset import BrainDataset
 import pdb
@@ -17,7 +18,44 @@ from natsort import natsorted
 from torch.utils.data import Dataset, DataLoader, random_split
 from itertools import chain
 from scipy import stats
+import argparse
 
+class AgeLoss(nn.Module):
+    def __init__(self):
+        super(AgeLoss, self).__init__()
+        
+    def forward(self, pred, uncertainty, target):
+        """
+        Custom loss function that combines MSE with uncertainty prediction
+        Args:
+            pred: predicted age
+            uncertainty: predicted uncertainty
+            target: true age
+        """
+        loss = 0.5 * torch.exp(-uncertainty) * (pred - target)**2 + 0.5 * uncertainty
+        return loss.mean()
+
+class CombinedLoss(nn.Module):
+    def __init__(self, kl_weight=0.1, age_weight=1.0, recon_weight=1.0):
+        super(CombinedLoss, self).__init__()
+        self.kl_weight = kl_weight
+        self.age_weight = age_weight
+        self.recon_weight = recon_weight
+        self.age_criterion = AgeLoss()
+        
+    def forward(self, recon_x, x, z_mean, z_log_var, pred_age, uncertainty, true_age):
+        # Reconstruction loss (L1 loss)
+        recon_loss = F.l1_loss(recon_x, x, reduction='mean') * self.recon_weight
+        
+        # KL divergence loss
+        kl_loss = -0.5 * torch.sum(1 + z_log_var - z_mean.pow(2) - z_log_var.exp()) * self.kl_weight
+        
+        # Age prediction loss with uncertainty
+        age_loss = self.age_criterion(pred_age, uncertainty, true_age.float()) * self.age_weight
+        
+        total_loss = recon_loss + kl_loss + age_loss
+        return total_loss, recon_loss, kl_loss, age_loss
+    
 def plotlatent(latent_vectors, ages, save_path=None):
     pca = PCA(n_components = 2)
     latent_2d = pca.fit_transform(latent_vectors)
@@ -31,14 +69,16 @@ def plotlatent(latent_vectors, ages, save_path=None):
     plt.close()
     
 
-def plot_predictions(true_ages, predicted_ages, epoch, save_dir='plots'):
-    """Plot and save age predictions"""
+def plot_predictions(type, true_ages, predicted_ages, uncertainties, epoch, save_dir='plots'):
+    """Plot and save age predictions with uncertainty"""
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     plt.figure(figsize=(10, 10))
     
-    # Scatter plot
-    plt.scatter(true_ages, predicted_ages, alpha=0.5)
+    # Scatter plot with error bars
+    plt.errorbar(true_ages, predicted_ages, 
+                yerr=2*np.sqrt(uncertainties),  # 2 standard deviations
+                fmt='o', alpha=0.3, elinewidth=0.5)
     
     # Plot perfect prediction line
     min_age = min(min(true_ages), min(predicted_ages))
@@ -54,14 +94,165 @@ def plot_predictions(true_ages, predicted_ages, epoch, save_dir='plots'):
     plt.ylabel('Predicted Age')
     plt.grid(True)
     
-    # Save plot
-    plt.savefig(f'{save_dir}/age_prediction_epoch_{epoch}.png')
+    plt.savefig(f'{save_dir}/age_prediction_epoch_{epoch}_{type}.png')
     plt.close()
     
     return mae, correlation
 
-config = {
-        'num_epochs':100,
+def train_model(config, model, train_loader, test_loader, device):
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10, verbose=True)
+    criterion = CombinedLoss(kl_weight=0.1, age_weight=1.0, recon_weight=1.0)
+    
+    best_val_loss = float('inf')
+    train_losses = []
+    val_losses = []
+    r_squared_best = 0
+    
+    for epoch in range(config["num_epochs"]):
+        # Training Phase
+        model.train()
+        epoch_losses = {'total': 0, 'recon': 0, 'kl': 0, 'age': 0}
+        train_true_ages = []
+        train_pred_ages = []
+        train_uncertainties = []
+        
+        pbar = tqdm(train_loader, desc=f'Training Epoch {epoch+1}/{config["num_epochs"]}')
+        for batch in pbar:
+            x = batch['image'].to(device)
+            age = batch['age'].to(device)
+            
+            # Forward pass
+            recon_x, z_mean, z_log_var, pred_age, uncertainty, latent = model(x)
+            
+            # Calculate losses
+            loss, recon_loss, kl_loss, age_loss = criterion(
+                recon_x, x, z_mean, z_log_var, pred_age, uncertainty, age
+            )
+            
+            # Optimization step
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            # Store losses and predictions
+            epoch_losses['total'] += loss.item()
+            epoch_losses['recon'] += recon_loss.item()
+            epoch_losses['kl'] += kl_loss.item()
+            epoch_losses['age'] += age_loss.item()
+            
+            train_true_ages.extend(age.cpu().numpy())
+            train_pred_ages.extend(pred_age.detach().cpu().numpy())
+            train_uncertainties.extend(uncertainty.detach().cpu().numpy())
+            
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'recon': f'{recon_loss.item():.4f}',
+                'kl': f'{kl_loss.item():.4f}',
+                'age': f'{age_loss.item():.4f}'
+            })
+        
+        # Plot training predictions
+        plot_predictions(config['type'],
+            np.array(train_true_ages).flatten(),
+            np.array(train_pred_ages).flatten(),
+            np.array(train_uncertainties).flatten(),
+            epoch,
+            save_dir='plots/train'
+        )
+        
+        # Validation Phase
+        model.eval()
+        val_losses = {'total': 0, 'recon': 0, 'kl': 0, 'age': 0}
+        val_true_ages = []
+        val_pred_ages = []
+        val_uncertainties = []
+        latents = []
+        
+        with torch.no_grad():
+            pbar = tqdm(test_loader, desc=f'Validation Epoch {epoch+1}/{config["num_epochs"]}')
+            for batch in pbar:
+                x = batch['image'].to(device)
+                age = batch['age'].to(device)
+                
+                # Forward pass
+                recon_x, z_mean, z_log_var, pred_age, uncertainty, latent = model(x)
+                
+                # Calculate losses
+                loss, recon_loss, kl_loss, age_loss = criterion(
+                    recon_x, x, z_mean, z_log_var, pred_age, uncertainty, age
+                )
+                
+                # Store results
+                val_losses['total'] += loss.item()
+                val_true_ages.extend(age.cpu().numpy())
+                val_pred_ages.extend(pred_age.cpu().numpy())
+                val_uncertainties.extend(uncertainty.cpu().numpy())
+                latents.extend(latent.cpu().numpy())
+                
+                pbar.set_postfix({
+                    'val_loss': f'{loss.item():.4f}',
+                    'val_recon': f'{recon_loss.item():.4f}',
+                    'val_kl': f'{kl_loss.item():.4f}',
+                    'val_age': f'{age_loss.item():.4f}'
+                })
+        
+        # Calculate validation metrics
+        val_true_ages = np.array(val_true_ages).flatten()
+        val_pred_ages = np.array(val_pred_ages).flatten()
+        slope, intercept, r_value, p_value, std_err = stats.linregress(val_true_ages, val_pred_ages)
+        r_squared = r_value ** 2
+        
+        # Plot validation results
+        plot_predictions(config['type'],
+            val_true_ages,
+            val_pred_ages,
+            np.array(val_uncertainties).flatten(),
+            epoch,
+            save_dir='plots/val'
+        )
+        
+        # Plot latent space
+        plotlatent(latents, val_true_ages, save_path=f'plots/latent/epoch_{epoch}.png')
+        data_type = config['type']
+        # Generate example brains
+        if epoch % 10 == 0:
+            recon = model.genBrain(torch.tensor([25, 60]).to(device))
+            nib.save(nib.Nifti1Image(recon[0], np.eye(4)), f'samples/young_{data_type}_epoch_{epoch}.nii.gz')
+            nib.save(nib.Nifti1Image(recon[1], np.eye(4)), f'samples/old_{data_type}_epoch_{epoch}.nii.gz')
+        
+        # Save best model
+        avg_val_loss = val_losses['total'] / len(test_loader)
+        torch.save(model.state_dict(), f'checkpoints/{data_type}_model.pt')
+        if r_squared > r_squared_best:
+            torch.save(model.state_dict(), f'checkpoints/{data_type}_best_model.pt')
+            r_squared_best = r_squared
+        
+        # Update learning rate
+        scheduler.step(avg_val_loss)
+        
+        print(f'\nEpoch {epoch+1} Summary:')
+        print(f'Train Loss: {epoch_losses["total"]/len(train_loader):.4f}')
+        print(f'Val Loss: {avg_val_loss:.4f}')
+        print(f'R-squared: {r_squared:.4f}')
+        print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+
+# Create necessary directories
+Path('plots/train').mkdir(parents=True, exist_ok=True)
+Path('plots/val').mkdir(parents=True, exist_ok=True)
+Path('plots/latent').mkdir(parents=True, exist_ok=True)
+Path('samples').mkdir(parents=True, exist_ok=True)
+Path('checkpoints').mkdir(parents=True, exist_ok=True)
+
+# Main training loop
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Brain Age Training')
+    parser.add_argument('--type', type=str, default='r_thickmap', help='Training Data Type (r_thickmap, r_T1w_norm_noskull)')
+    args = parser.parse_args()
+
+    config = {
+        'num_epochs':200,
         'learning_rate':1e-4,
         'input_size': [144,176,128], #9,11,8
         'num_workers': 0,
@@ -70,150 +261,44 @@ config = {
         'num_young': 4,
         'num_elderly': 4, 
         'dataset': ['camcan', 'HCP_aging', 'NIMH-IRP'],
-        'type': 'r_thickmap' #r_thickmap, r_T1w_norm_noskull
+        'type': args.type, #r_thickmap, r_T1w_norm_noskull
     }
 
-## Setting up dataloader ########################################################
-df_camcan = pd.read_csv('/ix1/haizenstein/jil202/studies/camcan/derivatives/report/study_report.csv')
-df_hcp = pd.read_csv('/ix1/haizenstein/jil202/studies/HCP_aging/derivatives/report/study_report.csv')
-df_nimh = pd.read_csv('/ix1/haizenstein/jil202/studies/NIMH-IRP/derivatives/report/study_report.csv')
-df = pd.concat([df_camcan, df_hcp, df_nimh], ignore_index=True)
-dfs = []
-niipaths = []
-data_type = config['type']
-for study in config['dataset']:
-    dfs.append(f'/ix1/haizenstein/jil202/studies/{study}/derivatives/report/study_report.csv')
-    niipaths.extend(glob.glob(f'/ix1/haizenstein/jil202/studies/{study}/derivatives/thickness/*/{data_type}.nii.gz'))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ## Setting up dataloader ########################################################
+    df_camcan = pd.read_csv('/ix1/haizenstein/jil202/studies/camcan/derivatives/report/study_report.csv')
+    df_hcp = pd.read_csv('/ix1/haizenstein/jil202/studies/HCP_aging/derivatives/report/study_report.csv')
+    df_nimh = pd.read_csv('/ix1/haizenstein/jil202/studies/NIMH-IRP/derivatives/report/study_report.csv')
+    df = pd.concat([df_camcan, df_hcp, df_nimh], ignore_index=True)
+    dfs = []
+    niipaths = []
+    data_type = config['type']
+    for study in config['dataset']:
+        dfs.append(f'/ix1/haizenstein/jil202/studies/{study}/derivatives/report/study_report.csv')
+        niipaths.extend(glob.glob(f'/ix1/haizenstein/jil202/studies/{study}/derivatives/thickness/*/{data_type}.nii.gz'))
 
-dataset = BrainDataset(report_paths=dfs, nii_paths=natsorted(niipaths), type=data_type, image_size=config['input_size'],)
-total_size = len(dataset)
-train_size = int(0.8 * total_size)
-test_size = total_size - train_size
-train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    dataset = BrainDataset(report_paths=dfs, nii_paths=natsorted(niipaths), type=data_type, image_size=config['input_size'],)
+    total_size = len(dataset)
+    train_size = int(0.8 * total_size)
+    test_size = total_size - train_size
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-train_loader = DataLoader(
-    train_dataset, 
-    batch_size=config['batch_size'], 
-    shuffle=True, 
-    num_workers=config['num_workers']
-)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=True, 
+        num_workers=config['num_workers']
+    )
 
-test_loader = DataLoader(
-    test_dataset, 
-    batch_size=config['batch_size'], 
-    shuffle=False, 
-    num_workers=config['num_workers']
-)
-##################################################################################
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = Conditional3DVAE(config).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
-scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10, verbose=True)
-best_val_loss = float('inf') 
-
-train_losses = []
-val_losses = []
-maes = []
-correlations = []
-
-for epoch in range(config["num_epochs"]):
-    model.train()
-    epoch_loss = 0
-    epoch_recon_loss = 0
-    epoch_kl_loss = 0
-    epoch_label_loss = 0
-    true_age = []
-    predicted_ages = []
-    pbar = tqdm(train_loader, desc=f'Training Epoch {epoch+1}/{config["num_epochs"]}')
-    for batch in pbar:
-        x = batch['image'].to(device)
-        age = batch['age'].to(device).long()
-        age_onehot = F.one_hot(age.squeeze(), num_classes=100).float().to(device)
-        recon_x, z_mean, z_log_var, predicted_age, latent = model(x)
-        true_age.extend(age.detach().cpu().numpy())
-        recon_loss = torch.nn.functional.l1_loss(recon_x, x, reduction='mean')
-        kl_loss = -0.5 * torch.sum(1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
-        age_loss = torch.nn.L1Loss()(age, predicted_age)
-
-        predicted_ages.extend(predicted_age.detach().cpu().numpy())
-        loss = (recon_loss + 0.1 * kl_loss + age_loss).mean()
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        epoch_loss += loss.item()
-        epoch_recon_loss += recon_loss.item()
-        epoch_kl_loss += kl_loss.item()
-
-        pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'recon': f'{recon_loss.item():.4f}',
-                'kl': f'{kl_loss.item():.4f}',
-            })
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=config['batch_size'], 
+        shuffle=False, 
+        num_workers=config['num_workers']
+    )
+    ##################################################################################
     
-    plt.scatter(true_age, predicted_ages)
-    plt.savefig('train_regression_brain.png')
-    plt.close()
-    avg_train_loss = epoch_loss / len(train_loader)
-    train_losses.append(avg_train_loss)
-    
-    model.eval()
-    val_epoch_loss = 0
-    val_epoch_recon_loss = 0
-    val_epoch_kl_loss = 0
-    val_epoch_label_loss = 0
-    
-    true_ages = []
-    predicted_ages = []
-    latents = []
-    true_age = []
-    predicted_ages = []
-    r_squared_best = 0
-    pbar = tqdm(test_loader, desc=f'Testing Epoch {epoch+1}/{config["num_epochs"]}')
-    for batch in pbar:
-        x = batch['image'].to(device)
-        age = batch['age'].to(device).long()
-        age_onehot = F.one_hot(age.squeeze(), num_classes=100).float().to(device)
-        
-        with torch.no_grad():
-            recon_x, z_mean, z_log_var, predicted_age, latent = model(x)
-            true_age.extend(age.detach().cpu().numpy())
-            predicted_ages.extend(predicted_age.detach().cpu().numpy())
-            latents.extend(latent.detach().cpu().numpy()) 
-            true_ages.extend(age.detach().cpu().numpy())
-            recon_loss = torch.nn.functional.l1_loss(recon_x, x, reduction='mean')
-            kl_loss = -0.5 * torch.sum(1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
-            loss = (recon_loss +  kl_loss ).mean()
-            
-        val_loss = (recon_loss + kl_loss).mean()
-
-        pbar.set_postfix({
-                'loss': f'{val_loss.item():.4f}',
-                'recon': f'{recon_loss.item():.4f}',
-                'kl': f'{kl_loss.item():.4f}',})
-        
-    slope, intercept, r_value, p_value, std_err = stats.linregress(np.array(true_age).flatten(), np.array(predicted_ages).flatten())
-    r_squared = r_value ** 2
-
-    plotlatent(latents, true_ages, save_path='latent.png')
-    
-    recon = model.genBrain(torch.tensor([25, 60]))
-    nib.save(nib.Nifti1Image(recon[0], np.eye(4)), f'25_{data_type}.nii.gz')
-    nib.save(nib.Nifti1Image(recon[1], np.eye(4)), f'60_{data_type}.nii.gz')
-    
-    avg_val_loss = val_epoch_loss / len(test_loader)
-    val_losses.append(avg_val_loss)
-    
-    scheduler.step(avg_val_loss)
-    
-    print(f'\nEpoch {epoch+1} Summary:')
-    print(f'Train Loss: {avg_train_loss:.4f}')
-    print(f'Val Loss: {avg_val_loss:.4f}')
-
-    if r_squared > r_squared_best:
-        torch.save(model.state_dict(), f'{data_type}_best.pt')
-        r_squared_best = r_squared
-
-        plt.scatter(true_age, predicted_ages)
-        plt.savefig(f'test_regression_{data_type}_best.png')
-        plt.close()
+    model = Conditional3DVAE(config).to(device)
+    model_path = f'/ix1/haizenstein/jil202/cortical_VAE_2025_01_07/gmba/checkpoints/{data_type}_best_model.pt'
+    model.load_state_dict(torch.load(model_path))
+    train_model(config, model, train_loader, test_loader, device)
