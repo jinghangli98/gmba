@@ -252,24 +252,32 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = {
-        'num_epochs':200,
+        'num_epochs':100,
         'learning_rate':1e-4,
         'input_size': [144,176,128], #9,11,8
-        'num_workers': 0,
+        'num_workers': 8,
         'train_ratio': 0.8,
-        'batch_size': 16,
+        'batch_size': 8,
         'num_young': 4,
         'num_elderly': 4, 
         'dataset': ['camcan', 'HCP_aging', 'NIMH-IRP'],
-        'type': args.type, #r_thickmap, r_T1w_norm_noskull
+        'type': args.type, # , r_T1w_norm_noskull
     }
-
+    # 'dataset': ['camcan', 'HCP_aging', 'NIMH-IRP',  'ds003097-download', 'ds002168-download',  'ds003592-download',
+    #                     'ds002382-download', 'ds002872-download', 'ds003639-download', 'ds003745-download', 'ds004173-download',
+    #                     'ds004215-download', 'ds004466-download', 'ds004604-download', 'ds004636-download', 'ds004725-download',
+    #                     'ds004856-download', 'ds005026-download', 'ds005123-download', 'ds005237-download', 'ds005270-download',
+    #                     'ds005364-download', 'ds005374-download', 'ds005418-download'],
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ## Setting up dataloader ########################################################
-    df_camcan = pd.read_csv('/ix1/haizenstein/jil202/studies/camcan/derivatives/report/study_report.csv')
-    df_hcp = pd.read_csv('/ix1/haizenstein/jil202/studies/HCP_aging/derivatives/report/study_report.csv')
-    df_nimh = pd.read_csv('/ix1/haizenstein/jil202/studies/NIMH-IRP/derivatives/report/study_report.csv')
-    df = pd.concat([df_camcan, df_hcp, df_nimh], ignore_index=True)
+    # df_camcan = pd.read_csv('/ix1/haizenstein/jil202/studies/camcan/derivatives/report/study_report.csv')
+    # df_hcp = pd.read_csv('/ix1/haizenstein/jil202/studies/HCP_aging/derivatives/report/study_report.csv')
+    # df_nimh = pd.read_csv('/ix1/haizenstein/jil202/studies/NIMH-IRP/derivatives/report/study_report.csv')
+    # df_ds002168 = pd.read_csv('/ix1/haizenstein/jil202/studies/ds002168-download/derivatives/report/study_report.csv')
+    # df_ds003097 = pd.read_csv('/ix1/haizenstein/jil202/studies/ds003097-download/derivatives/report/study_report.csv')
+    # df_ds003592 = pd.read_csv('/ix1/haizenstein/jil202/studies/ds003592-download/derivatives/report/study_report.csv')
+
+    # df = pd.concat([df_camcan, df_hcp, df_nimh, df_ds002168, df_ds003097, df_ds003592], ignore_index=True)
     dfs = []
     niipaths = []
     data_type = config['type']
@@ -300,5 +308,5 @@ if __name__ == "__main__":
     
     model = Conditional3DVAE(config).to(device)
     model_path = f'/ix1/haizenstein/jil202/cortical_VAE_2025_01_07/gmba/checkpoints/{data_type}_best_model.pt'
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path), strict=False)
     train_model(config, model, train_loader, test_loader, device)

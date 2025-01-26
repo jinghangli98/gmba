@@ -4,6 +4,157 @@ import torch.nn.functional as F
 import numpy as np
 import pdb
 
+class DenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super(DenseLayer, self).__init__()
+        # Bottleneck layer (1x1x1 conv)
+        self.bn1 = nn.BatchNorm3d(in_channels)
+        self.conv1 = nn.Conv3d(in_channels, 4 * growth_rate, kernel_size=1, bias=False)
+        
+        # 3x3x3 conv layer
+        self.bn2 = nn.BatchNorm3d(4 * growth_rate)
+        self.conv2 = nn.Conv3d(4 * growth_rate, growth_rate, kernel_size=3, 
+                              padding=1, bias=False)
+    
+    def forward(self, x):
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        return torch.cat([x, out], 1)
+
+class DenseBlock(nn.Module):
+    def __init__(self, in_channels, num_layers, growth_rate):
+        super(DenseBlock, self).__init__()
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.layers.append(DenseLayer(in_channels + i * growth_rate, growth_rate))
+    
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class TransitionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(TransitionBlock, self).__init__()
+        self.bn = nn.BatchNorm3d(in_channels)
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.pool = nn.AvgPool3d(kernel_size=2, stride=2)
+    
+    def forward(self, x):
+        out = self.conv(F.relu(self.bn(x)))
+        return self.pool(out)
+
+class BrainAgePrediction(nn.Module):
+    def __init__(self, input_shape=(144, 176, 128), growth_rate=48):
+        super(BrainAgePrediction, self).__init__()
+        
+        self.input_shape = input_shape
+        
+        # Initial convolution
+        self.conv1 = nn.Conv3d(1, 64, kernel_size=5, stride=2, padding=2, bias=False)
+        
+        # Calculate dimensions after initial convolution
+        curr_dims = [dim // 2 for dim in input_shape]  # Due to stride=2
+        
+        # Dense blocks configuration
+        self.dense_configs = [3, 6, 12, 8]  # Number of layers in each dense block
+        
+        # First dense block
+        self.dense1 = DenseBlock(64, self.dense_configs[0], growth_rate)
+        in_channels = 64 + self.dense_configs[0] * growth_rate
+        
+        # First transition
+        self.trans1 = TransitionBlock(in_channels, in_channels // 2)
+        in_channels = in_channels // 2
+        curr_dims = [dim // 2 for dim in curr_dims]
+        
+        # Second dense block
+        self.dense2 = DenseBlock(in_channels, self.dense_configs[1], growth_rate)
+        in_channels = in_channels + self.dense_configs[1] * growth_rate
+        
+        # Second transition
+        self.trans2 = TransitionBlock(in_channels, in_channels // 2)
+        in_channels = in_channels // 2
+        curr_dims = [dim // 2 for dim in curr_dims]
+        
+        # Third dense block
+        self.dense3 = DenseBlock(in_channels, self.dense_configs[2], growth_rate)
+        in_channels = in_channels + self.dense_configs[2] * growth_rate
+        
+        # Third transition
+        self.trans3 = TransitionBlock(in_channels, in_channels // 2)
+        in_channels = in_channels // 2
+        curr_dims = [dim // 2 for dim in curr_dims]
+        
+        # Fourth dense block
+        self.dense4 = DenseBlock(in_channels, self.dense_configs[3], growth_rate)
+        in_channels = in_channels + self.dense_configs[3] * growth_rate
+        
+        # Global average pooling
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        
+        # Shared feature layers
+        self.shared_features = nn.Sequential(
+            nn.Linear(in_channels, 1457),
+            nn.ReLU(),
+            nn.Dropout(0.5)
+        )
+        
+        # Age prediction head
+        self.age_head = nn.Linear(1457, 1)
+        
+        # Uncertainty (log variance) prediction head
+        self.uncertainty_head = nn.Linear(1457, 1)
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+    def forward(self, x):
+        # Initial convolution
+        out = self.conv1(x)
+        
+        # Dense blocks and transitions
+        out = self.dense1(out)
+        out = self.trans1(out)
+        
+        out = self.dense2(out)
+        out = self.trans2(out)
+        
+        out = self.dense3(out)
+        out = self.trans3(out)
+        
+        out = self.dense4(out)
+        
+        # Global average pooling
+        out = self.global_pool(out)
+        out = out.view(out.size(0), -1)
+        
+        # Shared features
+        features = self.shared_features(out)
+        
+        # Age prediction
+        age_pred = self.age_head(features)
+        
+        # Uncertainty prediction (log variance)
+        log_var = self.uncertainty_head(features)
+        
+        # Convert log variance to standard deviation for easier interpretation
+        uncertainty = torch.exp(0.5 * log_var)
+        
+        return age_pred, uncertainty
+    
 class SEBlock3D(nn.Module):
     """Squeeze-and-Excitation block for 3D inputs"""
     def __init__(self, channels, reduction_ratio=8):
@@ -42,20 +193,18 @@ class AgePredictor(nn.Module):
     def __init__(self, config):
         super(AgePredictor, self).__init__()
         
-        self.config = config
-        # Reduced initial channels
+        self.config = config        
+        # Rest of the architecture remains the same
         self.conv1 = nn.Conv3d(1, 16, kernel_size=3, stride=2, padding=1)
         self.conv2 = nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1)
         self.conv3 = nn.Conv3d(32, 64, kernel_size=3, stride=2, padding=1)
         self.conv4 = nn.Conv3d(64, 128, kernel_size=3, stride=2, padding=1)
         
-        # Group Normalization
         self.gn1 = nn.GroupNorm(4, 16)
         self.gn2 = nn.GroupNorm(8, 32)
         self.gn3 = nn.GroupNorm(8, 64)
         self.gn4 = nn.GroupNorm(16, 128)
         
-        # SE blocks
         self.se1 = SEBlock3D(16)
         self.se2 = SEBlock3D(32)
         self.se3 = SEBlock3D(64)
@@ -69,7 +218,7 @@ class AgePredictor(nn.Module):
         self.fc_uncertainty = nn.Linear(128, 1)
         
         self.dropout = nn.Dropout(0.3)
-        
+    
     def _get_flatten_size(self):
         input_x, input_y, input_z = self.config['input_size']
         x = torch.randn(1, 1, input_x, input_y, input_z)
@@ -87,7 +236,7 @@ class AgePredictor(nn.Module):
         x = self.se4(x)
         return x
     
-    def forward(self, x):
+    def forward(self, x):        
         x = self._forward_features(x)
         x = x.flatten(1)
         
@@ -191,7 +340,7 @@ class Decoder(nn.Module):
         x = F.leaky_relu(self.in2(self.deconv2(x)), 0.2)
         x = self.res2(x)
         x = F.leaky_relu(self.in3(self.deconv3(x)), 0.2)
-        x = self.deconv4(x)
+        x = torch.sigmoid(self.deconv4(x))
         
         return x
 
@@ -201,9 +350,9 @@ class Conditional3DVAE(nn.Module):
         
         self.encoder = Encoder(config, in_channels, latent_dim)
         self.decoder = Decoder(config, latent_dim)
-        self.age_predictor = AgePredictor(config)
+        self.age_predictor = BrainAgePrediction()
         self.condition_embedding = nn.Linear(condition_dim, 64)
-        
+    
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -215,7 +364,6 @@ class Conditional3DVAE(nn.Module):
         condition_encoded = F.relu(self.condition_embedding(age_onehot))
         z = torch.rand(len(age), 128).to('cuda')
         z = torch.cat([z, condition_encoded], dim=1)
-
         return self.decoder(z).detach().cpu().numpy().squeeze()
     
     def forward(self, x):
@@ -226,7 +374,7 @@ class Conditional3DVAE(nn.Module):
         
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-
+        
         if len(condition_encoded.shape) == 1:
             condition_encoded = condition_encoded.unsqueeze(0)
             

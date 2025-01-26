@@ -71,4 +71,4 @@ class BrainDataset(Dataset):
             return np.squeeze(processed)/processed.max()
         elif self.type == 'r_thickmap':
         
-            return np.squeeze(processed)
+            return np.squeeze(processed)/processed.max()
